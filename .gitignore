@@ -1,0 +1,14 @@
+# Environment variables
+.env
+
+# Docker data
+postgres_data/
+redis_data/
+n8n_data/
+gowa_data/
+
+# Statics
+statics/
+
+# Logs
+*.log
