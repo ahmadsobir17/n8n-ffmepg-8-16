@@ -440,10 +440,37 @@ def generate_crop_filter(analysis, duration, force_mode='auto'):
         filter_parts.append(part)
         seg_names.append(f"[{seg_id}]")
     
-    # Concat all segments if multiple
+    # Concat all segments with smooth crossfade transitions
     if len(segments) > 1:
-        concat = "".join(seg_names) + f"concat=n={len(segments)}:v=1:a=0[stacked]"
-        filter_str = ";".join(filter_parts) + ";" + concat
+        # Use slideup for professional-looking transitions (0.5s)
+        fade_duration = 0.5
+        
+        # Build xfade chain progressively
+        xfade_parts = []
+        prev_output = seg_names[0]  # Start with [v0]
+        cumulative_duration = segments[0]['end'] - segments[0]['start']
+        
+        for i in range(1, len(segments)):
+            next_seg = seg_names[i]
+            
+            # Output label: intermediate [x0], [x1], etc. or final [stacked]
+            if i < len(segments) - 1:
+                output = f"[x{i-1}]"
+            else:
+                output = "[stacked]"
+            
+            # Offset = cumulative duration so far minus fade overlap
+            offset = max(0, cumulative_duration - fade_duration)
+            
+            xfade = f"{prev_output}{next_seg}xfade=transition=slideup:duration={fade_duration}:offset={offset:.3f}{output}"
+            xfade_parts.append(xfade)
+            
+            # Update cumulative duration (add next segment, minus fade overlap)
+            seg_duration = segments[i]['end'] - segments[i]['start']
+            cumulative_duration = offset + seg_duration
+            prev_output = output
+        
+        filter_str = ";".join(filter_parts) + ";" + ";".join(xfade_parts)
     else:
         # Just rename the single segment to [stacked]
         last_seg_name = seg_names[0]
