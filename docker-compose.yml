@@ -14,7 +14,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 150M
+          memory: 256M
     healthcheck:
       test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}" ]
       interval: 10s
@@ -33,17 +33,17 @@ services:
     deploy:
       resources:
         limits:
-          memory: 64M
+          memory: 128M
     healthcheck:
       test: [ "CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping" ]
       interval: 10s
       timeout: 5s
       retries: 5
 
-  n8n-prod:
+  n8n-clipper:
     build: .
     # image: n8nio/n8n:latest
-    container_name: n8n-prod
+    container_name: n8n-clipper
     restart: always
     environment:
       N8N_CORS_ORIGIN: http://localhost:3000,https://axiamasi.com
@@ -83,7 +83,7 @@ services:
       - ./scripts:/app/scripts
       - /opt/n8n-clipper/output:/data/output
       - /opt/n8n-clipper/tmp:/tmp/clipper
-      - /opt/n8n-clipper/cookies:/cookies
+      - /opt/n8n-clipper/yt-cookie.txt:/cookies/youtube.txt
     user: "root"
     ports:
       - "5679:5678"
@@ -92,35 +92,18 @@ services:
         condition: service_healthy
       redis-prod:
         condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5678/healthz', timeout=2)" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     networks:
       - production
     deploy:
       resources:
         limits:
-          memory: 1G
-
-  gowa:
-    image: aldinokemal2104/go-whatsapp-web-multidevice
-    container_name: gowa-prod
-    restart: always
-    ports:
-      - "3000:3000"
-    environment:
-      - APP_BASIC_AUTH=${GOWA_BASIC_AUTH:-admin:@Agusahmad17}
-      - APP_PORT=3000
-      - APP_DEBUG=false
-      - APP_OS=Mac OS
-      - WHATSAPP_WEBHOOK=${WHATSAPP_WEBHOOK}
-      - TZ=Asia/Jakarta
-    volumes:
-      - ./gowa_data:/app/storages
-      - ./statics:/app/statics
-    networks:
-      - production
-    deploy:
-      resources:
-        limits:
-          memory: 150M
+          memory: 4G
 
   cloudflared:
     image: cloudflare/cloudflared:latest
@@ -128,13 +111,16 @@ services:
     restart: always
     command: tunnel --no-autoupdate run --protocol http2
     environment:
-      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN_PROD}
+      - TUNNEL_TOKEN=${CF_TUNNEL_TOKEN}
+    depends_on:
+      n8n-clipper:
+        condition: service_healthy
     networks:
       - production # Pake satu network aja
     deploy:
       resources:
         limits:
-          memory: 64M
+          memory: 128M
 
 networks:
   production:
