@@ -83,7 +83,7 @@ services:
       - ./scripts:/app/scripts
       - /opt/n8n-clipper/output:/data/output
       - /opt/n8n-clipper/tmp:/tmp/clipper
-      - /opt/n8n-clipper/yt-cookie.txt:/cookies/youtube.txt
+      - /opt/n8n-clipper/cookies/youtube.txt:/cookies/youtube.txt
     user: "root"
     ports:
       - "5679:5678"

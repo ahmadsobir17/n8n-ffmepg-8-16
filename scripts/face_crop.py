@@ -193,7 +193,7 @@ def generate_crop_filter(analysis, duration, words, emphasis):
     return filter_parts[0].replace(v_names[0], "[stacked]").replace(a_names[0], "[stackeda]"), "[stackeda]"
 
 def transcribe_audio(video_path, start_time, duration):
-    print("  Transcribing audio with Whisper (base)...")
+    print("  Transcribing audio with Whisper (medium)...")
     temp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
     temp.close()
     try:
