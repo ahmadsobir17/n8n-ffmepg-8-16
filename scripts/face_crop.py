@@ -442,7 +442,7 @@ def generate_crop_filter(analysis, duration, force_mode='auto'):
     
     # Concat all segments with smooth crossfade transitions
     if len(segments) > 1:
-        # Use slideup for professional-looking transitions (0.5s)
+        # Use dissolve for smooth transitions (0.5s)
         fade_duration = 0.5
         
         # Build xfade chain progressively
@@ -462,7 +462,7 @@ def generate_crop_filter(analysis, duration, force_mode='auto'):
             # Offset = cumulative duration so far minus fade overlap
             offset = max(0, cumulative_duration - fade_duration)
             
-            xfade = f"{prev_output}{next_seg}xfade=transition=slideup:duration={fade_duration}:offset={offset:.3f}{output}"
+            xfade = f"{prev_output}{next_seg}xfade=transition=dissolve:duration={fade_duration}:offset={offset:.3f}{output}"
             xfade_parts.append(xfade)
             
             # Update cumulative duration (add next segment, minus fade overlap)
