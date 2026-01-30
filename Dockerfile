@@ -14,6 +14,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     procps \
     nodejs \
+    fontconfig \
+    fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python packages: yt-dlp, OpenCV, MediaPipe (pinned version for mp.solutions compatibility)
@@ -24,7 +26,7 @@ RUN pip3 install --break-system-packages torch torchvision torchaudio --index-ur
 RUN pip3 install --break-system-packages openai-whisper
 
 # Pre-download Whisper model (tiny = 75MB, fastest)
-RUN python3 -c "import whisper; whisper.load_model('tiny')"
+RUN python3 -c "import whisper; whisper.load_model('base')"
 
 # Download and install static ffmpeg
 ADD https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz /tmp/ffmpeg.tar.xz
