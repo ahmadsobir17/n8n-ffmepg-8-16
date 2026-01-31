@@ -18,12 +18,24 @@ os.environ['MEDIAPIPE_GPU_DISABLED'] = '1'
 os.environ['OPENCV_LOG_LEVEL'] = 'OFF'
 os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
 
+# Limit Threading to prevent CPU 100% overload
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['VECLIB_MAXIMUM_THREADS'] = '1'
+os.environ['NUMEXPR_NUM_THREADS'] = '1'
+
 try:
     import cv2
     import mediapipe as mp
     import whisper
+    import torch # Added to control whisper/torch threads
     import gc
     import numpy as np
+    
+    # Limit library-specific threading
+    cv2.setNumThreads(1)
+    torch.set_num_threads(1)
 except ImportError as e:
     print(f"Error: Required packages not installed: {e}")
     sys.exit(1)
@@ -65,7 +77,7 @@ def get_video_info(video_path):
 def extract_segment_h264(video_path, start_time, duration):
     temp = tempfile.NamedTemporaryFile(suffix='_seg.mp4', delete=False)
     temp.close()
-    cmd = ['ffmpeg', '-y', '-ss', str(start_time), '-t', str(duration), '-i', video_path, '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-an', temp.name]
+    cmd = ['ffmpeg', '-y', '-threads', '1', '-ss', str(start_time), '-t', str(duration), '-i', video_path, '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-an', temp.name]
     if subprocess.run(cmd, capture_output=True).returncode == 0: return temp.name
     return None
 
@@ -112,7 +124,7 @@ def analyze_audio_emphasis(video_path, start_time, duration):
     temp_wav = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
     temp_wav.close()
     try:
-        cmd = ['ffmpeg', '-y', '-ss', str(start_time), '-t', str(duration), '-i', video_path, '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', temp_wav.name]
+        cmd = ['ffmpeg', '-y', '-threads', '1', '-ss', str(start_time), '-t', str(duration), '-i', video_path, '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', temp_wav.name]
         subprocess.run(cmd, capture_output=True)
         with wave.open(temp_wav.name, 'rb') as wf:
             audio_data = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).astype(np.float32)
@@ -195,8 +207,8 @@ def generate_crop_filter(analysis, duration, words, emphasis):
     # Build video and audio chains
     f_str = ";".join(filter_parts)
     
+    # Audio output mapping
     if len(segments) == 1:
-        # Single segment: just rename
         f_str = f_str.replace("[v0]", "[stacked]").replace("[a0]", "[main_audio]")
     else:
         # Multiple segments: crossfade
@@ -210,35 +222,6 @@ def generate_crop_filter(analysis, duration, words, emphasis):
             cv, ca = vo, ao
         f_str += ";" + ";".join(chains)
 
-    # ====== SFX CHAINS (LOUD!) ======
-    sfx_chains = []
-    sfx_nodes = []
-    
-    # 1. HOOK SOUND: Vine Boom at start (VERY LOUD)
-    sfx_chains.append(f"[4:a]atrim=0:1.5,volume=3.0[hook_boom]")
-    sfx_nodes.append("hook_boom")
-    
-    # 2. HOOK WHOOSH at start
-    sfx_chains.append(f"[1:a]atrim=0:0.5,volume=2.5[hook_whoosh]")
-    sfx_nodes.append("hook_whoosh")
-    
-    # 3. TRANSITION WHOOSH for each segment change
-    for i in range(1, len(segments)):
-        t_ms = int(cum_times[i] * 1000)
-        sfx_chains.append(f"[1:a]atrim=0:0.5,volume=2.0,adelay={t_ms}|{t_ms}[trans_whoosh{i}]")
-        sfx_nodes.append(f"trans_whoosh{i}")
-    
-    # Background Music (subtle)
-    f_str += f";[3:a]aloop=loop=-1:size=2e+09,atrim=0:{duration},volume=0.08[bgm_loop]"
-    f_str += f";[main_audio][bgm_loop]amix=inputs=2:duration=first:weights=1 0.2[with_bgm]"
-    
-    # Add all SFX chains
-    f_str += ";" + ";".join(sfx_chains)
-    
-    # Final mix: with_bgm + all SFX nodes
-    all_sfx = "".join([f"[{n}]" for n in sfx_nodes])
-    f_str += f";[with_bgm]{all_sfx}amix=inputs={len(sfx_nodes)+1}:duration=first[stackeda]"
-
     # Adjust subtitle timestamps for crossfade shifts
     ts, cur = 0, 0
     for wd in words:
@@ -246,16 +229,16 @@ def generate_crop_filter(analysis, duration, words, emphasis):
             cur += 1; ts += fade_duration
         wd['start'] = max(0, wd['start'] - ts); wd['end'] = max(wd['start'] + 0.1, wd['end'] - ts)
     
-    return f_str, "[stackeda]"
+    return f_str, "[main_audio]"
 
 
 def transcribe_audio(video_path, start_time, duration):
-    print("  Transcribing audio with Whisper (medium)...")
+    print("  Transcribing audio with Whisper (base)...")
     temp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
     temp.close()
     try:
         subprocess.run(['ffmpeg', '-y', '-ss', str(start_time), '-t', str(duration), '-i', video_path, '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', temp.name], capture_output=True)
-        model = whisper.load_model('medium')
+        model = whisper.load_model('base')
         res = model.transcribe(temp.name, word_timestamps=True, language='id')
         words = []
         for s in res.get('segments', []):
@@ -282,8 +265,8 @@ def generate_ass_subtitle(words, analysis, title=None):
     
     header = ("[Script Info]\nPlayResX: 1080\nPlayResY: 1920\n[V4+ Styles]\n"
               "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-              "Style: Default,Liberation Sans,54,&H00FFFFFF,&H000000FF,&H00000000,&HC0000000,-1,0,0,0,100,100,2,0,1,4,2,2,40,40,120,1\n"
-              "Style: Hook,Liberation Sans,80,&H0000FFFF,&H000000FF,&H00000000,&H90000000,-1,0,0,0,100,100,2,0,3,10,0,6,60,60,150,1\n"
+              "Style: Default,Liberation Sans,54,&H00FFFFFF,&H000000FF,&H00FFFF00,&HC0000000,-1,0,0,0,100,100,2,0,1,3,2,2,40,40,120,1\n"
+              "Style: Hook,Liberation Sans,90,&H00FFFF00,&H000000FF,&H00000000,&H90000000,-1,0,0,0,100,100,2,0,3,10,0,6,60,60,150,1\n"
               "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
     
     events = ""
@@ -302,20 +285,7 @@ def generate_ass_subtitle(words, analysis, title=None):
 def process_video(input_file, output_file, start_time, duration, ass_file=None, hook_title=None):
     print(f"  Starting video processing for {output_file}...")
     
-    assets_dir = Path(__file__).parent / "assets"
-    whoosh_sfx = assets_dir / "whoosh.mp3"
-    pop_sfx = assets_dir / "pop.mp3"
-    bg_music = assets_dir / "bg_music.mp3"
-    vine_boom = assets_dir / "vine_boom.mp3"
-    ding_sfx = assets_dir / "ding.mp3"
-    
-    # Fallback to silent audio if assets are missing
-    extra_inputs = []
-    # Index mapping: 1=whoosh, 2=pop, 3=bg, 4=vine, 5=ding
-    for asset in [whoosh_sfx, pop_sfx, bg_music, vine_boom, ding_sfx]:
-        if asset.exists(): extra_inputs.extend(["-i", str(asset)])
-        else: extra_inputs.extend(["-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo:d=5"])
-    
+    # Video analysis and processing
     analysis = analyze_video(input_file, start_time, duration)
     if not analysis:
         print("  Error: Video analysis failed."); return
@@ -339,16 +309,15 @@ def process_video(input_file, output_file, start_time, duration, ass_file=None, 
     gc.collect()
     
     print("  Executing FFmpeg...")
-    # IMPORTANT: -ss and -t BEFORE -i for fast seek, applied to main video ONLY
-    # SFX inputs are added WITHOUT seek so they start at 0
-    cmd = ['ffmpeg', '-y']
-    cmd.extend(['-ss', str(actual_start), '-t', str(duration), '-i', input_file])
-    cmd.extend(extra_inputs)
+    # Use -ss after -i for accurate seeking in complex filters
+    cmd = ['ffmpeg', '-y', '-threads', '2'] # Final render can use 2 threads for slightly better speed
+    cmd.extend(['-i', input_file, '-ss', str(actual_start), '-t', str(duration)])
     cmd.extend([
         '-filter_complex', f_complex,
         '-map', v_stream, '-map', a_stream,
         '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
         '-c:a', 'aac', '-b:a', '128k',
+        '-async', '1',  # Fix audio sync drift
         '-movflags', '+faststart', output_file
     ])
     

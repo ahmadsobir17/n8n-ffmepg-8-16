@@ -1,15 +1,22 @@
-# Environment variables
-.env
-
-# Docker data
+# n8n Data & Databases
+n8n_data/
 postgres_data/
 redis_data/
-n8n_data/
-gowa_data/
 
-# Statics
-statics/
+# Temporary files and output
+tmp/
+output/
+*.mp4
+*.wav
+*.ass
+__pycache__/
 
-# Logs
-*.log
-tmp
+# Credentials & Sensitive Info
+.env
+*.txt
+cookies/
+*.pem
+*.key
+
+# Docker
+.dockerignore
