@@ -126,6 +126,19 @@ def extract_segment_h264(video_path, start_time, duration):
         return temp.name
     
     return None
+def smooth_coordinates(data, window_size=9):
+    """Simple moving average smoothing for face coordinates"""
+    if not data:
+        return []
+    if len(data) < window_size:
+        return data
+    smoothed = []
+    for i in range(len(data)):
+        start = max(0, i - window_size // 2)
+        end = min(len(data), i + window_size // 2 + 1)
+        avg = sum(data[start:end]) / (end - start)
+        smoothed.append(avg)
+    return smoothed
 
 def analyze_video_dynamic(video_path, start_time, duration, ai_mode='auto'):
     """
@@ -245,6 +258,12 @@ def analyze_video_dynamic(video_path, start_time, duration, ai_mode='auto'):
         
         del frame
     
+    # Smooth primary_x coordinates for better follow-camera effect
+    x_coords = [f['primary_x'] for f in frame_data]
+    smoothed_x = smooth_coordinates(x_coords, window_size=11)
+    for i, f in enumerate(frame_data):
+        f['smoothed_x'] = smoothed_x[i]
+
     cap.release()
     os.unlink(temp_seg)
     detector.close()
@@ -312,6 +331,7 @@ def analyze_video_dynamic(video_path, start_time, duration, ai_mode='auto'):
         'video_height': h,
         'segments': segments,
         'adjusted_start_time': start_time,
+        '_frame_data': frame_data,  # Keep for tracking
         'stats': {
             'dual_count': dual_count,
             'dual_ratio': dual_ratio,
@@ -366,7 +386,7 @@ def transcribe_audio(video_path, start_time, duration):
         if os.path.exists(temp.name):
             os.unlink(temp.name)
 
-def generate_crop_filter(analysis, duration, words):
+def generate_crop_filter(analysis, duration, words, tracking=True):
     """Generate FFmpeg filter_complex untuk crop dan zoom"""
     w, h = analysis['video_width'], analysis['video_height']
     segments = analysis['segments']
@@ -375,6 +395,7 @@ def generate_crop_filter(analysis, duration, words):
     aspect_9_16 = 9/16
     aspect_panel = 1080/960
     
+    target_fps = 30
     fade_duration = 0.3 if len(segments) > 1 else 0
     
     filter_parts = []
@@ -385,39 +406,94 @@ def generate_crop_filter(analysis, duration, words):
         start, end, mode = seg['start'], seg['end'], seg['mode']
         v_seg, a_seg = f"v{i}", f"a{i}"
         
-        trim_v = f"fps=20,trim=start={start}:end={end},setpts=PTS-STARTPTS"
+        trim_v = f"fps={target_fps},trim=start={start}:end={end},setpts=PTS-STARTPTS"
         trim_a = f"aresample=async=1,atrim=start={start}:end={end},asetpts=PTS-STARTPTS"
         
         # Simple zoom (hook zoom aja, skip emphasis untuk save CPU)
         z_expr = "1.0+0.2*between(time,0,1.5)*sin(PI*time/1.5)"
         
-        zoom_filter = f"zoompan=z='{z_expr}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s={out_w}x{out_h}:fps=20"
-        zoom_filter_panel = f"zoompan=z='{z_expr}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s={out_w}x{panel_h}:fps=20"
+        zoom_filter = f"zoompan=z='{z_expr}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s={out_w}x{out_h}:fps={target_fps}"
+        zoom_filter_panel = f"zoompan=z='{z_expr}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s={out_w}x{panel_h}:fps={target_fps}"
         
         if mode == 'wide':
             # Split dual panel
-            cw = min(w // 2 - 20, int(h * aspect_panel))
-            ch = int(cw / aspect_panel)
+            cw = (min(w // 2 - 20, int(h * aspect_panel)) // 2) * 2
+            ch = (int(cw / aspect_panel) // 2) * 2
             lx = max(0, int(w*0.25)-cw//2)
             rx = min(w-cw, int(w*0.75)-cw//2)
             y = (h - ch) // 2
             
             part = (
                 f"[0:v]{trim_v},split=2[t{i}][b{i}];"
-                f"[t{i}]crop={cw}:{ch}:{lx}:{y},scale={out_w}:{panel_h},setsar=1,fps=20,format=yuv420p,{zoom_filter_panel}[top{i}];"
-                f"[b{i}]crop={cw}:{ch}:{rx}:{y},scale={out_w}:{panel_h},setsar=1,fps=20,format=yuv420p,{zoom_filter_panel}[bot{i}];"
+                f"[t{i}]crop={cw}:{ch}:{lx}:{y},scale={out_w}:{panel_h},setsar=1,fps={target_fps},format=yuv420p,{zoom_filter_panel}[top{i}];"
+                f"[b{i}]crop={cw}:{ch}:{rx}:{y},scale={out_w}:{panel_h},setsar=1,fps={target_fps},format=yuv420p,{zoom_filter_panel}[bot{i}];"
                 f"[top{i}][bot{i}]vstack=inputs=2[{v_seg}];"
                 f"[0:a]{trim_a}[{a_seg}]"
             )
         else:
             # Closeup single person
-            ch = h
-            cw = int(h * aspect_9_16)
-            xb = max(0, min(int(seg['avg_x'] * w) - cw // 2, w - cw))
+            ch = (h // 2) * 2
+            cw = (int(h * aspect_9_16) // 2) * 2
             
+            # SPEAKER TRACKING LOGIC
+            seg_frames = [f for f in analysis.get('_frame_data', []) if start <= f['timestamp'] <= end]
+            
+            if not tracking or not seg_frames:
+                xb = max(0, min(int(seg['avg_x'] * w) - cw // 2, w - cw))
+                x_expr = str(xb)
+            else:
+                # Sub-sample tracking points to avoid too long expression (every 0.4s)
+                tracking_points = []
+                last_t = -1
+                for f in seg_frames:
+                    if f['timestamp'] >= last_t + 0.4:
+                        tracking_points.append((f['timestamp'], f['smoothed_x']))
+                        last_t = f['timestamp']
+                
+                if len(tracking_points) < 2:
+                    # Fallback to static avg_x
+                    xb = max(0, min(int(seg['avg_x'] * w) - cw // 2, w - cw))
+                    x_expr = str(xb)
+                else:
+                    # Create FLAT expression for linear movement to avoid FFmpeg recursion limit
+                    # Formula: trunc(sum((p1 + (p2-p1)*(t-t1)/(t2-t1)) * between(t, t1, t2)))
+                    parts = []
+                    
+                    # Ensure first value is covered if start > first point (unlikely with current logic but safe)
+                    first_x = max(0, min(int(tracking_points[0][1] * w) - cw // 2, w - cw))
+                    
+                    for j in range(len(tracking_points) - 1):
+                        t1, x1 = tracking_points[j]
+                        t2, x2 = tracking_points[j+1]
+                        
+                        # Convert rel to px crop x
+                        p1 = max(0, min(int(x1 * w) - cw // 2, w - cw))
+                        p2 = max(0, min(int(x2 * w) - cw // 2, w - cw))
+                        
+                        rel_t1 = round(t1 - start, 3)
+                        rel_t2 = round(t2 - start, 3)
+                        dur = round(t2 - t1, 3)
+                        
+                        if p1 == p2:
+                            lerp = str(p1)
+                        else:
+                            lerp = f"({p1}+({p2}-{p1})*(t-{rel_t1})/{dur})"
+                        
+                        # Use gte/lt to avoid overlap doubling if simply summing
+                        # The last segment will use between to be inclusive
+                        if j == len(tracking_points) - 2:
+                            parts.append(f"({lerp}*between(t,{rel_t1},{rel_t2}))")
+                        else:
+                            parts.append(f"({lerp}*gte(t,{rel_t1})*lt(t,{rel_t2}))")
+                    
+                    # Full expression: trunc(part1 + part2 + ...)
+                    # Add a fallback for t < tracking_points[0]
+                    first_rel_t = round(tracking_points[0][0] - start, 3)
+                    x_expr = f"trunc({first_x}*lt(t,{first_rel_t}) + {' + '.join(parts)})"
+
             part = (
-                f"[0:v]{trim_v},crop={cw}:{ch}:{xb}:0,"
-                f"scale={out_w}:{out_h},setsar=1,fps=20,format=yuv420p,{zoom_filter}[{v_seg}];"
+                f"[0:v]{trim_v},crop={cw}:{ch}:'{x_expr}':0,"
+                f"scale={out_w}:{out_h},setsar=1,fps={target_fps},format=yuv420p,{zoom_filter}[{v_seg}];"
                 f"[0:a]{trim_a}[{a_seg}]"
             )
         
@@ -426,7 +502,7 @@ def generate_crop_filter(analysis, duration, words):
         a_names.append(f"[{a_seg}]")
     
     if not segments or not v_names:
-        return f"[0:v]scale={out_w}:{out_h},setsar=1,fps=20,format=yuv420p[stacked];[0:a]acopy[stackeda]", "[stackeda]"
+        return f"[0:v]scale={out_w}:{out_h},setsar=1,fps={target_fps},format=yuv420p[stacked];[0:a]acopy[stackeda]", "[stackeda]"
     
     f_str = ";".join(filter_parts)
     
@@ -552,7 +628,7 @@ def generate_ass_subtitle(words, analysis, title=None):
     
     return header + events
 
-def process_video(input_file, output_file, start_time, duration, ass_file=None, hook_title=None, ai_mode='auto'):
+def process_video(input_file, output_file, start_time, duration, ass_file=None, hook_title=None, ai_mode='auto', tracking=True):
     """Main processing function"""
     print(f"\n=== Video Processing Start ===")
     print(f"Input: {input_file}")
@@ -583,7 +659,7 @@ def process_video(input_file, output_file, start_time, duration, ass_file=None, 
     words = transcribe_audio(input_file, actual_start, duration)
     
     # Generate filter
-    f_complex, a_stream = generate_crop_filter(analysis, duration, words)
+    f_complex, a_stream = generate_crop_filter(analysis, duration, words, tracking=tracking)
     
     # Cleanup before FFmpeg
     gc.collect()
@@ -615,7 +691,7 @@ def process_video(input_file, output_file, start_time, duration, ass_file=None, 
     
     # FFmpeg command
     cmd = [
-        'ffmpeg', '-y', '-threads', '2',
+        'ffmpeg', '-y', '-threads', '4',
         '-ss', str(actual_start),
         '-t', str(duration),
         '-i', input_file,
@@ -624,9 +700,11 @@ def process_video(input_file, output_file, start_time, duration, ass_file=None, 
         '-map', a_stream,
         '-c:v', 'libx264',
         '-preset', 'ultrafast',
-        '-crf', '25',
+        '-crf', '20',  # Lower CRF for higher quality (~10Mbps target)
         '-c:a', 'aac',
-        '-b:a', '96k',
+        '-b:a', '256k',
+        '-ar', '48000',
+        '-ac', '2',
         '-max_muxing_queue_size', '4096',
         '-movflags', '+faststart',
         output_file
@@ -661,6 +739,8 @@ if __name__ == '__main__':
     )
     # Alias untuk compatibility dengan n8n
     parser.add_argument('-title', dest='title_alias', help='Hook title banner alias')
+    parser.add_argument('--tracking', action='store_true', default=True, help='Enable speaker tracking (follow-camera)')
+    parser.add_argument('--no-tracking', action='store_false', dest='tracking', help='Disable speaker tracking')
     
     args = parser.parse_args()
     
@@ -680,7 +760,8 @@ if __name__ == '__main__':
         args.duration,
         args.ass_file,
         args.title,
-        args.ai_mode
+        args.ai_mode,
+        tracking=args.tracking
     )
     
     print("\n=== Processing Complete! ===")
