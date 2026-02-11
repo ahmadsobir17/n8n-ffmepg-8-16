@@ -39,7 +39,7 @@ services:
     container_name: n8n-clipper
     restart: always
     environment:
-      N8N_CORS_ORIGIN: http://localhost:3000,https://axiamasi.com
+      N8N_CORS_ORIGIN: http://localhost:3000,https://axiamasi.com,https://clipper.axiamasi.com
       EXECUTIONS_DATA_PRUNE: true
       EXECUTIONS_DATA_PRUNE_MAX_COUNT: 200
       N8N_LOG_LEVEL: error
@@ -92,6 +92,10 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 12G
     networks:
       - production
 

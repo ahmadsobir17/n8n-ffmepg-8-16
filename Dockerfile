@@ -26,8 +26,8 @@ RUN pip3 install --break-system-packages yt-dlp opencv-python-headless mediapipe
 RUN pip3 install --break-system-packages torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
 RUN pip3 install --break-system-packages openai-whisper
 
-# Pre-download Whisper model (turbo = large-v3-turbo, higher accuracy)
-RUN python3 -c "import whisper; whisper.load_model('turbo')"
+# Pre-download Whisper model (small model - better accuracy for Indonesian)
+RUN python3 -c "import whisper; model = whisper.load_model('small')"
 
 # FFmpeg is now installed via apt-get for better reliability
 

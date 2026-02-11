@@ -3,7 +3,6 @@
 Face Detection Auto-Crop for Podcast Videos
 Optimized for Tencent Cloud Lighthouse 2GB/2CPU
 AI Dynamic Closeup/Split Detection
-=== Alex Hormozi / Sector Ngedit Editing Style ===
 """
 
 from pathlib import Path
@@ -37,8 +36,8 @@ try:
     import gc
     import numpy as np
     
-    cv2.setNumThreads(2)
-    torch.set_num_threads(2)
+    cv2.setNumThreads(4)
+    torch.set_num_threads(4)
 except ImportError as e:
     print(f"Error: {e}")
     print("Install: pip install opencv-python mediapipe openai-whisper torch numpy")
@@ -47,13 +46,6 @@ except ImportError as e:
 # Working directory
 WORK_DIR = '/tmp/clipper'
 os.makedirs(WORK_DIR, exist_ok=True)
-
-# Keywords that trigger yellow highlight in captions (Hormozi style)
-HIGHLIGHT_KEYWORDS = {
-    'INDONESIA', 'RASULULLAH', 'ISLAM', 'ALLAH', 'QURAN',
-    'MUSLIM', 'SUNNAH', 'DAKWAH', 'MUKMIN', 'IMAN',
-    'JIHAD', 'HIDAYAH', 'TAQWA', 'IBADAH', 'AKHIRAT',
-}
 
 class FaceDetector:
     def __init__(self, min_confidence=0.3):
@@ -135,7 +127,6 @@ def extract_segment_h264(video_path, start_time, duration):
         return temp.name
     
     return None
-
 def smooth_coordinates(data, window_size=9):
     """Simple moving average smoothing for face coordinates"""
     if not data:
@@ -371,15 +362,15 @@ def transcribe_audio(video_path, start_time, duration):
         ]
         subprocess.run(cmd, capture_output=True)
         
-        # Transcribe with small model (better accuracy for Indonesian)
-        model = whisper.load_model('small')
+        # Transcribe with turbo model (large-v3-turbo) + optimized params
+        model = whisper.load_model('turbo')
         result = model.transcribe(
             temp.name,
             word_timestamps=True,
             language='id',
             fp16=False,
-            beam_size=3,
-            best_of=3,
+            beam_size=5,
+            best_of=5,
         )
         
         words = []
@@ -396,19 +387,10 @@ def transcribe_audio(video_path, start_time, duration):
             w['start'] = max(0, w['start'] - 0.05)
             w['end'] = w['end'] + 0.05
         
-        # Aggressive cleanup - free model RAM before FFmpeg
-        del model
-        del result
+        # Cleanup
+        del model, result
         gc.collect()
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        # Force Python to release memory back to OS
-        import ctypes
-        try:
-            ctypes.CDLL('libc.so.6').malloc_trim(0)
-        except:
-            pass
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
         
         return words
         
@@ -417,7 +399,7 @@ def transcribe_audio(video_path, start_time, duration):
             os.unlink(temp.name)
 
 def generate_crop_filter(analysis, duration, words, tracking=True):
-    """Generate FFmpeg filter_complex for crop, zoom, and color grading"""
+    """Generate FFmpeg filter_complex untuk crop dan zoom"""
     w, h = analysis['video_width'], analysis['video_height']
     segments = analysis['segments']
     
@@ -447,16 +429,15 @@ def generate_crop_filter(analysis, duration, words, tracking=True):
             rx = min(w-cw, int(w*0.75)-cw//2)
             y = (h - ch) // 2
             
-            # Each panel = 954px (even for yuv420p), divider = 12px, total = 1920px
-            panel_h_adj = 954
-            divider_h = 12
+            # Each panel = 955px, divider = 10px, total = 1920px
+            panel_h_adj = 955
             
             part = (
                 f"[0:v]{trim_v},split=2[t{i}][b{i}];"
                 f"[t{i}]crop={cw}:{ch}:{lx}:{y},scale={out_w}:{panel_h_adj}:flags=lanczos,setsar=1,fps={target_fps},format=yuv420p[top{i}];"
                 f"[b{i}]crop={cw}:{ch}:{rx}:{y},scale={out_w}:{panel_h_adj}:flags=lanczos,setsar=1,fps={target_fps},format=yuv420p[bot{i}];"
-                f"[top{i}]pad={out_w}:{panel_h_adj + divider_h}:0:0:black[tpad{i}];"
-                f"[tpad{i}][bot{i}]vstack=inputs=2,scale={out_w}:{out_h}:flags=lanczos,setsar=1[{v_seg}];"
+                f"[top{i}]pad={out_w}:{panel_h_adj + 10}:0:0:black[tpad{i}];"
+                f"[tpad{i}][bot{i}]vstack=inputs=2[{v_seg}];"
                 f"[0:a]{trim_a}[{a_seg}]"
             )
         else:
@@ -485,8 +466,10 @@ def generate_crop_filter(analysis, duration, words, tracking=True):
                     x_expr = str(xb)
                 else:
                     # Create FLAT expression for linear movement to avoid FFmpeg recursion limit
+                    # Formula: trunc(sum((p1 + (p2-p1)*(t-t1)/(t2-t1)) * between(t, t1, t2)))
                     parts = []
                     
+                    # Ensure first value is covered if start > first point (unlikely with current logic but safe)
                     first_x = max(0, min(int(tracking_points[0][1] * w) - cw // 2, w - cw))
                     
                     for j in range(len(tracking_points) - 1):
@@ -506,11 +489,15 @@ def generate_crop_filter(analysis, duration, words, tracking=True):
                         else:
                             lerp = f"({p1}+({p2}-{p1})*(t-{rel_t1})/{dur})"
                         
+                        # Use gte/lt to avoid overlap doubling if simply summing
+                        # The last segment will use between to be inclusive
                         if j == len(tracking_points) - 2:
                             parts.append(f"({lerp}*between(t,{rel_t1},{rel_t2}))")
                         else:
                             parts.append(f"({lerp}*gte(t,{rel_t1})*lt(t,{rel_t2}))")
                     
+                    # Full expression: trunc(part1 + part2 + ...)
+                    # Add a fallback for t < tracking_points[0]
                     first_rel_t = round(tracking_points[0][0] - start, 3)
                     x_expr = f"trunc({first_x}*lt(t,{first_rel_t}) + {' + '.join(parts)})"
 
@@ -571,6 +558,13 @@ def generate_crop_filter(analysis, duration, words, tracking=True):
     
     return f_str, "[main_audio]"
 
+# Keywords that trigger yellow highlight in captions
+HIGHLIGHT_KEYWORDS = {
+    'INDONESIA', 'RASULULLAH', 'ISLAM', 'ALLAH', 'QURAN',
+    'MUSLIM', 'SUNNAH', 'DAKWAH', 'MUKMIN', 'IMAN',
+    'JIHAD', 'HIDAYAH', 'TAQWA', 'IBADAH', 'AKHIRAT',
+}
+
 def format_ass_time(s):
     """Format time for ASS subtitle"""
     return f"{int(s//3600)}:{int((s%3600)//60):02d}:{int(s%60):02d}.{int((s%1)*100):02d}"
@@ -599,6 +593,7 @@ def generate_ass_subtitle(words, analysis, title=None):
     segments = analysis['segments']
     phrases = []
     cur_phrase = []
+    cur_words = []  # Keep individual word data for highlighting
     cur_start = None
     
     # Group words into 1-2 word phrases for fast-paced pop effect
@@ -607,6 +602,7 @@ def generate_ass_subtitle(words, analysis, title=None):
             cur_start = w['start']
         
         cur_phrase.append(w['word'].upper())
+        cur_words.append(w)
         
         # End phrase on 2 words OR on punctuation
         if len(cur_phrase) >= 2 or w['word'].rstrip().endswith(('.', '?', '!', ',')):
@@ -616,6 +612,7 @@ def generate_ass_subtitle(words, analysis, title=None):
                 'end': w['end']
             })
             cur_phrase = []
+            cur_words = []
             cur_start = None
     
     # Remaining words
@@ -669,6 +666,8 @@ def generate_ass_subtitle(words, analysis, title=None):
             if s['start'] <= p['start'] <= s['end']:
                 mode = s['mode']
                 break
+        
+        # Position based on mode
         # Wide (split): center between panels at y=960
         # Closeup: near bottom at y=1650
         y = 960 if mode == 'wide' else 1650
@@ -758,7 +757,7 @@ def process_video(input_file, output_file, start_time, duration, ass_file=None, 
     
     # FFmpeg command
     cmd = [
-        'ffmpeg', '-y', '-threads', '2',
+        'ffmpeg', '-y', '-threads', '6',
         '-ss', str(actual_start),
         '-t', str(duration),
         '-i', input_file,
@@ -767,7 +766,7 @@ def process_video(input_file, output_file, start_time, duration, ass_file=None, 
         '-map', a_stream,
         '-c:v', 'libx264',
         '-preset', 'ultrafast',
-        '-crf', '23',  # Balanced quality vs file size (was 18, reduced to fix OOM + upload timeout)
+        '-crf', '18',  # Speed-quality balance
         '-c:a', 'aac',
         '-b:a', '256k',
         '-ar', '48000',
@@ -790,7 +789,7 @@ def process_video(input_file, output_file, start_time, duration, ass_file=None, 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='AI-Powered Face Detection Auto-Crop (Hormozi Style)'
+        description='AI-Powered Face Detection Auto-Crop (Optimized for 2GB RAM)'
     )
     
     parser.add_argument('-i', '--input', required=True, help='Input video file')
