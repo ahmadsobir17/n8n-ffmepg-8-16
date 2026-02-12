@@ -121,11 +121,12 @@ def extract_segment_h264(video_path, start_time, duration):
         temp.name
     ]
     
-    result = subprocess.run(cmd, capture_output=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, errors='replace')
     
     if result.returncode == 0:
         return temp.name
     
+    print(f"  Error extracting segment: {result.stderr}")
     return None
 def smooth_coordinates(data, window_size=9):
     """Simple moving average smoothing for face coordinates"""
@@ -343,7 +344,7 @@ def analyze_video_dynamic(video_path, start_time, duration, ai_mode='auto'):
     }
 
 def transcribe_audio(video_path, start_time, duration):
-    """Transcribe audio using Whisper turbo model with optimized params"""
+    """Transcribe audio using Whisper small model with optimized params"""
     print("  Transcribing audio...")
     
     temp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False, dir=WORK_DIR)
@@ -360,10 +361,13 @@ def transcribe_audio(video_path, start_time, duration):
             '-ar', '16000', '-ac', '1',
             temp.name
         ]
-        subprocess.run(cmd, capture_output=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, errors='replace')
+        if result.returncode != 0:
+            print(f"  Error extracting audio: {result.stderr}")
+            return []
         
-        # Transcribe with turbo model (large-v3-turbo) + optimized params
-        model = whisper.load_model('turbo')
+        # Transcribe with small model + optimized params
+        model = whisper.load_model('small')
         result = model.transcribe(
             temp.name,
             word_timestamps=True,
@@ -429,14 +433,15 @@ def generate_crop_filter(analysis, duration, words, tracking=True):
             rx = min(w-cw, int(w*0.75)-cw//2)
             y = (h - ch) // 2
             
-            # Each panel = 955px, divider = 10px, total = 1920px
-            panel_h_adj = 955
+            # Each panel = 956px, divider = 8px, total = 1920px (MUST BE EVEN FOR YUV420P)
+            panel_h_adj = 956
+            div_h = 8
             
             part = (
                 f"[0:v]{trim_v},split=2[t{i}][b{i}];"
                 f"[t{i}]crop={cw}:{ch}:{lx}:{y},scale={out_w}:{panel_h_adj}:flags=lanczos,setsar=1,fps={target_fps},format=yuv420p[top{i}];"
                 f"[b{i}]crop={cw}:{ch}:{rx}:{y},scale={out_w}:{panel_h_adj}:flags=lanczos,setsar=1,fps={target_fps},format=yuv420p[bot{i}];"
-                f"[top{i}]pad={out_w}:{panel_h_adj + 10}:0:0:black[tpad{i}];"
+                f"[top{i}]pad={out_w}:{panel_h_adj + div_h}:0:0:black[tpad{i}];"
                 f"[tpad{i}][bot{i}]vstack=inputs=2[{v_seg}];"
                 f"[0:a]{trim_a}[{a_seg}]"
             )
@@ -695,28 +700,28 @@ def generate_ass_subtitle(words, analysis, title=None):
 
 def process_video(input_file, output_file, start_time, duration, ass_file=None, hook_title=None, ai_mode='auto', tracking=True):
     """Main processing function"""
-    print(f"\n=== Video Processing Start ===")
-    print(f"Input: {input_file}")
-    print(f"Output: {output_file}")
-    print(f"Start: {start_time}s, Duration: {duration}s")
-    print(f"AI Mode: {ai_mode}")
+    print(f"\n=== Video Processing Start ===", flush=True)
+    print(f"Input: {input_file}", flush=True)
+    print(f"Output: {output_file}", flush=True)
+    print(f"Start: {start_time}s, Duration: {duration}s", flush=True)
+    print(f"AI Mode: {ai_mode}", flush=True)
     
     # Validate ai_mode
     valid_modes = ['auto', 'prefer_closeup', 'prefer_split']
     if ai_mode not in valid_modes:
-        print(f"Warning: Invalid ai_mode '{ai_mode}', using 'auto'")
+        print(f"Warning: Invalid ai_mode '{ai_mode}', using 'auto'", flush=True)
         ai_mode = 'auto'
     
     # Check input file
     if not os.path.exists(input_file):
         print(f"Error: Input file not found: {input_file}")
-        return
+        sys.exit(1)
     
     # Video analysis
     analysis = analyze_video_dynamic(input_file, start_time, duration, ai_mode)
     if not analysis:
         print("Error: Video analysis failed")
-        return
+        sys.exit(1)
     
     actual_start = analysis['adjusted_start_time']
     
@@ -747,8 +752,8 @@ def process_video(input_file, output_file, start_time, duration, ass_file=None, 
     
     # Build FFmpeg filter with ASS (burns on top of color-graded stream)
     if ass_file and os.path.exists(ass_file) and os.path.getsize(ass_file) > 100:
-        # Escape ASS path for FFmpeg
-        ass_escaped = ass_file.replace('\\', '\\\\\\\\').replace(':', '\\\\:')
+        # Escape ASS path for FFmpeg (handling both Linux and possible WSL paths)
+        ass_escaped = ass_file.replace('\\', '/').replace("'", r"\'").replace(":", r"\:")
         f_complex += f";[graded]ass='{ass_escaped}'[outv]"
         v_stream = "[outv]"
         print(f"  ✓ ASS subtitle enabled")
@@ -765,10 +770,10 @@ def process_video(input_file, output_file, start_time, duration, ass_file=None, 
         '-map', v_stream,
         '-map', a_stream,
         '-c:v', 'libx264',
-        '-preset', 'ultrafast',
-        '-crf', '18',  # Speed-quality balance
+        '-preset', 'veryfast',
+        '-crf', '24',  # Optimized for size/quality balance
         '-c:a', 'aac',
-        '-b:a', '256k',
+        '-b:a', '128k',
         '-ar', '48000',
         '-ac', '2',
         '-max_muxing_queue_size', '4096',
@@ -776,16 +781,23 @@ def process_video(input_file, output_file, start_time, duration, ass_file=None, 
         output_file
     ]
     
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, errors='replace')
     
     if result.returncode != 0:
-        print(f"  FFmpeg failed: {result.stderr[-500:]}")
+        print(f"--- FFmpeg Command Failed ---")
+        print(f"Command: {' '.join(cmd)}")
+        print(f"Error: {result.stderr}")
+        sys.exit(1)
     else:
         if os.path.exists(output_file):
             size_mb = os.path.getsize(output_file) / (1024*1024)
             print(f"  ✓ Success: {output_file} ({size_mb:.2f} MB)")
+            if size_mb < 0.001:
+                print("  ⚠ Warning: Output file is effectively empty (0 bytes).")
+                sys.exit(1)
         else:
             print("  Error: Output file not created")
+            sys.exit(1)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
