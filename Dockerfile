@@ -16,6 +16,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     nodejs \
     fontconfig \
     fonts-liberation \
+    fonts-dejavu-core \
+    fonts-noto-color-emoji \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
