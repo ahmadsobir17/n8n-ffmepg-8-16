@@ -62,6 +62,17 @@ except ImportError as e:
 # Working directory
 WORK_DIR = '/tmp/clipper'
 ASSETS_DIR = Path(__file__).parent / 'assets'
+
+# Whoosh SFX collection for random variety on transitions
+WHOOSH_FILES = [
+    'Whooosh Swoosh - 9.wav',
+    'Whoosh Swoosh - 21.wav',
+    'Whoosh Swoosh - 6.wav',
+    'Whoosh-1.wav',
+    'Whoosh Swoosh-30.wav',
+]
+# Background music (loops, very low volume)
+BG_MUSIC_FILE = 'diedlonely - in the bleak midwinter.mp3'
 os.makedirs(WORK_DIR, exist_ok=True)
 
 def fuzzy_keyword_match(word, map_dict, threshold=None):
@@ -232,6 +243,114 @@ def smooth_coordinates(data, window_size=9):
         smoothed.append(avg)
     return smoothed
 
+def compute_active_speaker_timeline(frame_data, window_sec=1.5, listener_interval=12.0, listener_duration=2.5):
+    """
+    Determine which speaker is 'active' (talking) per frame.
+    Uses face area variance as proxy: talking face has more jaw movement → higher area variance.
+    
+    Args:
+        frame_data: list of frame dicts with 'all_faces' containing center_x, rel_w, rel_h
+        window_sec: sliding window size in seconds for variance computation
+        listener_interval: how often (seconds) to briefly show the listener
+        listener_duration: how long (seconds) to show the listener
+    
+    Returns:
+        Enriched frame_data with 'active_speaker_x' per frame
+    """
+    if not frame_data or len(frame_data) < 3:
+        return frame_data
+    
+    # Classify each face as left or right speaker per frame
+    # and compute their face areas
+    for f in frame_data:
+        left_areas = []
+        right_areas = []
+        left_xs = []
+        right_xs = []
+        left_ws = []
+        right_ws = []
+        for face in f.get('all_faces', []):
+            area = face.get('rel_w', 0) * face.get('rel_h', 0)
+            cx = face['center_x']
+            fw = face.get('rel_w', 0)
+            if cx < 0.5:
+                left_areas.append(area)
+                left_xs.append(cx)
+                left_ws.append(fw)
+            else:
+                right_areas.append(area)
+                right_xs.append(cx)
+                right_ws.append(fw)
+        f['_left_area'] = sum(left_areas) / len(left_areas) if left_areas else 0
+        f['_right_area'] = sum(right_areas) / len(right_areas) if right_areas else 0
+        f['_left_x'] = sum(left_xs) / len(left_xs) if left_xs else 0.25
+        f['_right_x'] = sum(right_xs) / len(right_xs) if right_xs else 0.75
+        f['_left_w'] = max(left_ws) if left_ws else 0.1
+        f['_right_w'] = max(right_ws) if right_ws else 0.1
+    
+    # Sliding window: compute area variance for left vs right speaker
+    for i, f in enumerate(frame_data):
+        ts = f['timestamp']
+        # Gather frames within the window
+        window_frames = [fd for fd in frame_data 
+                        if abs(fd['timestamp'] - ts) <= window_sec / 2]
+        
+        left_areas_w = [fd['_left_area'] for fd in window_frames if fd['_left_area'] > 0]
+        right_areas_w = [fd['_right_area'] for fd in window_frames if fd['_right_area'] > 0]
+        
+        # Compute variance (higher = more jaw movement = talking)
+        def variance(vals):
+            if len(vals) < 2:
+                return 0
+            mean = sum(vals) / len(vals)
+            return sum((v - mean) ** 2 for v in vals) / len(vals)
+        
+        left_var = variance(left_areas_w)
+        right_var = variance(right_areas_w)
+        
+        # The speaker with higher variance is talking
+        if left_var > right_var * 1.2:  # 20% margin to avoid flicker
+            f['active_speaker_x'] = f['_left_x']
+            f['active_speaker_w'] = f['_left_w']
+            f['_active_side'] = 'left'
+        elif right_var > left_var * 1.2:
+            f['active_speaker_x'] = f['_right_x']
+            f['active_speaker_w'] = f['_right_w']
+            f['_active_side'] = 'right'
+        else:
+            # Tie or no data — keep current primary
+            f['active_speaker_x'] = f.get('primary_x', 0.5)
+            f['active_speaker_w'] = max(f['_left_w'], f['_right_w'])
+            f['_active_side'] = 'left' if f.get('primary_x', 0.5) < 0.5 else 'right'
+    
+    # Inject occasional "listener focus" windows for variety
+    if frame_data:
+        total_duration = frame_data[-1]['timestamp'] - frame_data[0]['timestamp']
+        if total_duration > listener_interval:
+            next_listener_t = listener_interval
+            while next_listener_t < total_duration:
+                for f in frame_data:
+                    if next_listener_t <= f['timestamp'] < next_listener_t + listener_duration:
+                        # Flip to the OTHER speaker (the listener)
+                        if f['_active_side'] == 'left':
+                            f['active_speaker_x'] = f['_right_x']
+                        else:
+                            f['active_speaker_x'] = f['_left_x']
+                next_listener_t += listener_interval
+    
+    # Smooth the active speaker X to avoid jitter
+    active_xs = [f['active_speaker_x'] for f in frame_data]
+    smoothed_active = smooth_coordinates(active_xs, window_size=15)
+    for i, f in enumerate(frame_data):
+        f['active_speaker_x'] = smoothed_active[i]
+    
+    # Cleanup temp keys
+    for f in frame_data:
+        for k in ['_left_area', '_right_area', '_left_x', '_right_x', '_left_w', '_right_w', '_active_side']:
+            f.pop(k, None)
+    
+    return frame_data
+
 # ============================================
 # AI VIDEO ANALYSIS
 # ============================================
@@ -255,6 +374,7 @@ def analyze_video_dynamic(video_path, start_time, duration, ai_mode='auto'):
     total_frames = 0
     
     CLOSEUP_FACE_AREA_THRESHOLD = 0.08
+    SPLIT_SEPARATION_THRESHOLD = 0.25  # Minimum horizontal separation for valid split
     
     while True:
         ret, frame = cap.read()
@@ -266,21 +386,31 @@ def analyze_video_dynamic(video_path, start_time, duration, ai_mode='auto'):
         ts = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
         faces = detector.detect_faces(frame)
         
-        if len(faces) >= 2: dual_count += 1
+        # Sort faces by x position (left to right)
+        faces_sorted = sorted(faces, key=lambda f: f['center_x'])
         
-        primary = faces[0] if faces else {'center_x': 0.5, 'center_y': 0.5, 'rel_w': 0, 'rel_h': 0}
+        # Compute face separation (distance between leftmost and rightmost face)
+        face_separation = 0.0
+        if len(faces_sorted) >= 2:
+            dual_count += 1
+            face_separation = faces_sorted[-1]['center_x'] - faces_sorted[0]['center_x']
+        
+        primary = faces_sorted[0] if faces_sorted else {'center_x': 0.5, 'center_y': 0.5, 'rel_w': 0, 'rel_h': 0}
         face_area = primary['rel_w'] * primary['rel_h']
         is_closeup_shot = face_area >= CLOSEUP_FACE_AREA_THRESHOLD
         if is_closeup_shot: closeup_count += 1
         
+        # Split is only valid if faces are far enough apart
+        valid_split = len(faces_sorted) >= 2 and face_separation >= SPLIT_SEPARATION_THRESHOLD
+        
         # Mode decision
         if ai_mode == 'prefer_split':
-            mode = 'wide' if (len(faces) >= 2 and not is_closeup_shot) else 'closeup'
+            mode = 'wide' if (valid_split and not is_closeup_shot) else 'closeup'
         elif ai_mode == 'prefer_closeup':
-            mode = 'wide' if (len(faces) >= 2 and dual_count > total_frames * 0.3 and not is_closeup_shot) else 'closeup'
+            mode = 'wide' if (valid_split and dual_count > total_frames * 0.3 and not is_closeup_shot) else 'closeup'
         else:  # auto
             if is_closeup_shot: mode = 'closeup'
-            elif len(faces) >= 2: mode = 'wide'
+            elif valid_split: mode = 'wide'
             elif is_ultrawide: mode = 'wide'
             else: mode = 'closeup'
             
@@ -288,13 +418,19 @@ def analyze_video_dynamic(video_path, start_time, duration, ai_mode='auto'):
             'timestamp': ts,
             'primary_x': primary['center_x'],
             'face_area': face_area,
-            'mode': mode
+            'mode': mode,
+            'all_faces': [{'center_x': f['center_x'], 'center_y': f['center_y'], 'rel_w': f.get('rel_w', 0), 'rel_h': f.get('rel_h', 0)} for f in faces_sorted],
+            'face_separation': face_separation
         })
         del frame
 
     x_coords = [f['primary_x'] for f in frame_data]
     smoothed_x = smooth_coordinates(x_coords, window_size=11)
     for i, f in enumerate(frame_data): f['smoothed_x'] = smoothed_x[i]
+    
+    # Compute active speaker timeline (who's talking)
+    frame_data = compute_active_speaker_timeline(frame_data)
+    print(f"    🎯 Active speaker timeline computed ({len(frame_data)} frames)", flush=True)
 
     cap.release()
     os.unlink(temp_seg)
@@ -312,16 +448,32 @@ def analyze_video_dynamic(video_path, start_time, duration, ai_mode='auto'):
                 start_t, curr_mode = frame_data[i]['timestamp'], frame_data[i]['mode']
         segments.append({'start': start_t, 'end': duration, 'mode': curr_mode})
     
-    # ── FORCED MODE ALTERNATION ──
-    # If >80% of the video is one mode (common in podcasts with 2 people),
-    # force alternating segments for visual variety.
+    # ── SPLIT VIABILITY VALIDATION ──
+    # For each 'wide' segment, verify faces are actually separated enough.
+    # If not, downgrade to 'closeup' (full screen of active speaker).
+    for seg in segments:
+        seg_frames = [f for f in frame_data if seg['start'] <= f['timestamp'] <= seg['end']]
+        if seg['mode'] == 'wide' and seg_frames:
+            # Check: do enough frames have 2+ separated faces?
+            valid_split_frames = [f for f in seg_frames if f['face_separation'] >= SPLIT_SEPARATION_THRESHOLD]
+            split_ratio = len(valid_split_frames) / len(seg_frames) if seg_frames else 0
+            if split_ratio < 0.40:
+                print(f"    ⚠ Segment {seg['start']:.1f}s-{seg['end']:.1f}s: split not viable (only {split_ratio:.0%} frames have separated faces), using closeup", flush=True)
+                seg['mode'] = 'closeup'
+    
+    # ── SMART MODE ALTERNATION ──
+    # Only force alternation if 2 distinct speakers are confirmed across the video.
+    avg_separation = sum(f['face_separation'] for f in frame_data) / len(frame_data) if frame_data else 0
+    dual_ratio = dual_count / total_frames if total_frames > 0 else 0
+    has_two_speakers = avg_separation >= SPLIT_SEPARATION_THRESHOLD and dual_ratio >= 0.30
+    
     total_dur = sum(s['end'] - s['start'] for s in segments)
     wide_dur = sum(s['end'] - s['start'] for s in segments if s['mode'] == 'wide')
     
-    if total_dur > 15 and (wide_dur / total_dur > 0.80 or wide_dur / total_dur < 0.20):
+    if has_two_speakers and total_dur > 15 and (wide_dur / total_dur > 0.80 or wide_dur / total_dur < 0.20):
         dominant = 'wide' if wide_dur / total_dur > 0.5 else 'closeup'
         alt = 'closeup' if dominant == 'wide' else 'wide'
-        print(f"    ⚡ Forcing mode alternation ({dominant} dominant: {wide_dur/total_dur:.0%})", flush=True)
+        print(f"    ⚡ Forcing mode alternation ({dominant} dominant: {wide_dur/total_dur:.0%}, avg_sep: {avg_separation:.2f})", flush=True)
         
         # Create alternating segments: dominant 8-12s, alt 4-6s
         new_segments = []
@@ -337,21 +489,45 @@ def analyze_video_dynamic(video_path, start_time, duration, ai_mode='auto'):
             t += seg_len
             use_dominant = not use_dominant
         
-        # Preserve face tracking data from original by mapping avg_x
+        # Re-validate wide segments in alternation
         for seg in new_segments:
             seg_frames = [f for f in frame_data if seg['start'] <= f['timestamp'] <= seg['end']]
-            seg['avg_x'] = sum(f['primary_x'] for f in seg_frames) / len(seg_frames) if seg_frames else 0.5
-            seg['avg_face_area'] = sum(f['face_area'] for f in seg_frames) / len(seg_frames) if seg_frames else 0
+            if seg['mode'] == 'wide' and seg_frames:
+                valid_split_frames = [f for f in seg_frames if f['face_separation'] >= SPLIT_SEPARATION_THRESHOLD]
+                split_ratio = len(valid_split_frames) / len(seg_frames) if seg_frames else 0
+                if split_ratio < 0.40:
+                    seg['mode'] = 'closeup'
         segments = new_segments
+    elif not has_two_speakers:
+        # No two distinct speakers detected — force all to closeup
+        for seg in segments:
+            if seg['mode'] == 'wide':
+                seg['mode'] = 'closeup'
+        print(f"    ℹ No distinct speaker pair detected (avg_sep: {avg_separation:.2f}, dual_ratio: {dual_ratio:.0%}), using closeup only", flush=True)
     
+    # ── ENRICH SEGMENTS with speaker positions ──
     for seg in segments:
         seg_frames = [f for f in frame_data if seg['start'] <= f['timestamp'] <= seg['end']]
         seg['avg_x'] = sum(f['primary_x'] for f in seg_frames) / len(seg_frames) if seg_frames else 0.5
         seg['avg_face_area'] = sum(f['face_area'] for f in seg_frames) / len(seg_frames) if seg_frames else 0
+        
+        # For wide mode: compute average position of Speaker 1 (left) and Speaker 2 (right)
+        if seg['mode'] == 'wide':
+            left_xs, right_xs = [], []
+            for f in seg_frames:
+                if len(f['all_faces']) >= 2:
+                    left_xs.append(f['all_faces'][0]['center_x'])   # leftmost face
+                    right_xs.append(f['all_faces'][-1]['center_x']) # rightmost face
+            seg['speaker1_x'] = sum(left_xs) / len(left_xs) if left_xs else 0.25
+            seg['speaker2_x'] = sum(right_xs) / len(right_xs) if right_xs else 0.75
+        else:
+            seg['speaker1_x'] = seg.get('avg_x', 0.5)
+            seg['speaker2_x'] = seg.get('avg_x', 0.5)
     
     print(f"  [1/4] Found {len(segments)} segments ({total_frames} frames analyzed)", flush=True)
     for i, seg in enumerate(segments):
-        print(f"    Seg {i}: {seg['start']:.1f}s → {seg['end']:.1f}s [{seg['mode']}]", flush=True)
+        extra = f" [S1@{seg['speaker1_x']:.2f}, S2@{seg['speaker2_x']:.2f}]" if seg['mode'] == 'wide' else ''
+        print(f"    Seg {i}: {seg['start']:.1f}s → {seg['end']:.1f}s [{seg['mode']}]{extra}", flush=True)
     
     return {
         'video_width': w, 'video_height': h,
@@ -409,6 +585,62 @@ def get_sfx_events(words):
                 events.append({'file': sfx_path, 'time': w['start'], 'keyword': k})
     return events
 
+
+def get_enhanced_sfx_events(words, analysis, has_hook_title=False):
+    """
+    Generate context-aware SFX events:
+    1. Whoosh on segment transitions (random from collection)
+    2. Pop on hook title appearance (first 0.2s)
+    3. Ding on highlight words (rate-limited: max 1 per 3.5s)
+    4. Keyword-triggered SFX (existing system)
+    """
+    events = []
+    
+    # 1. Hook title pop (at 0.2s so it syncs with pop-in animation)
+    if has_hook_title:
+        pop_path = str(ASSETS_DIR / 'pop.mp3')
+        if os.path.exists(pop_path):
+            events.append({'file': pop_path, 'time': 0.2, 'keyword': 'HOOK_POP', 'volume': 0.25})
+    
+    # 2. Whoosh on segment transitions
+    segments = analysis.get('segments', [])
+    if len(segments) > 1:
+        available_whooshes = [f for f in WHOOSH_FILES if os.path.exists(str(ASSETS_DIR / f))]
+        if available_whooshes:
+            cumulative_t = 0
+            for i, seg in enumerate(segments[:-1]):  # All segments except last
+                cumulative_t += seg.get('duration', seg.get('end', 0) - seg.get('start', 0))
+                # Pick random whoosh for variety
+                whoosh_file = available_whooshes[i % len(available_whooshes)]
+                whoosh_path = str(ASSETS_DIR / whoosh_file)
+                # Whoosh starts slightly before the cut (-0.15s)
+                whoosh_t = max(0, cumulative_t - 0.15)
+                events.append({'file': whoosh_path, 'time': whoosh_t, 'keyword': 'TRANSITION', 'volume': 0.20})
+    
+    # 3. Ding on highlight words (rate-limited: max 1 per 3.5s)
+    ding_path = str(ASSETS_DIR / 'ding.mp3')
+    last_ding_t = -999
+    if os.path.exists(ding_path):
+        for w in words:
+            clean = w['word'].strip().upper().rstrip('.,!?;:')
+            if clean in HIGHLIGHT_KEYWORDS and w['start'] - last_ding_t >= 3.5:
+                events.append({'file': ding_path, 'time': w['start'], 'keyword': f'HIGHLIGHT:{clean}', 'volume': 0.15})
+                last_ding_t = w['start']
+    
+    # 4. Keyword-triggered SFX (existing system, skip duplicates)
+    existing_times = {e['time'] for e in events}
+    for w in words:
+        k, v = fuzzy_keyword_match(w['word'], SFX_MAP)
+        if k and w['start'] not in existing_times:
+            sfx_path = str(ASSETS_DIR / v)
+            if os.path.exists(sfx_path):
+                events.append({'file': sfx_path, 'time': w['start'], 'keyword': k, 'volume': 0.20})
+                existing_times.add(w['start'])
+    
+    # Sort by time
+    events.sort(key=lambda e: e['time'])
+    return events
+
 # ============================================
 # FFMPEG FILTER GENERATION
 # ============================================
@@ -449,14 +681,22 @@ def generate_crop_filter(analysis, duration, words, tracking=True):
         if mode == 'wide':
             # ═══════════════════════════════════════
             # WIDE MODE: Split screen (top + bottom)
+            # Speaker 1 (left face) = TOP panel
+            # Speaker 2 (right face) = BOTTOM panel
             # ═══════════════════════════════════════
-            panel_aspect = out_w / 956
+            panel_h_adj, div_h = 956, 8
+            panel_aspect = out_w / panel_h_adj
             cw = (min(vid_w // 2 - 20, int(vid_h * panel_aspect)) // 4) * 4
             ch = (int(cw / panel_aspect) // 4) * 4
-            lx = max(0, int(vid_w * 0.25) - cw // 2)
-            rx = min(vid_w - cw, int(vid_w * 0.75) - cw // 2)
+            
+            # Use actual speaker positions from face detection
+            s1_x = seg.get('speaker1_x', 0.25)  # left face → top panel
+            s2_x = seg.get('speaker2_x', 0.75)  # right face → bottom panel
+            
+            # Center crop on each speaker's face position
+            lx = max(0, min(int(s1_x * vid_w) - cw // 2, vid_w - cw))
+            rx = max(0, min(int(s2_x * vid_w) - cw // 2, vid_w - cw))
             y = (vid_h - ch) // 2
-            panel_h_adj, div_h = 956, 8
             
             part = (
                 f"[0:v]{trim_v},split=2[t{i}][b{i}];"
@@ -480,10 +720,36 @@ def generate_crop_filter(analysis, duration, words, tracking=True):
                 xb = max(0, min(int(seg['avg_x'] * vid_w) - target_w // 2, vid_w - target_w))
                 x_expr = str(xb)
             else:
+                # Use active_speaker_x (follows the talker) instead of smoothed_x
+                # Also use face width to ensure face stays fully in frame
                 tracking_points, last_t = [], -1
                 for f in seg_frames:
                     if f['timestamp'] >= last_t + 0.4:
-                        tracking_points.append((f['timestamp'], f['smoothed_x']))
+                        speaker_x = f.get('active_speaker_x', f['smoothed_x'])
+                        face_w = f.get('active_speaker_w', 0.1)
+                        
+                        # Face-aware clamping: ensure entire face bbox stays in crop
+                        # Add 15% margin around face for breathing room
+                        face_half_w_rel = (face_w * 1.15) / 2
+                        # Clamp speaker_x so that face edges don't exceed crop boundaries
+                        # The crop window is target_w wide, centered on speaker_x
+                        # Face left edge: (speaker_x - face_half_w_rel) * vid_w
+                        # Crop left edge: speaker_x * vid_w - target_w / 2
+                        # We need: crop_left <= face_left AND face_right <= crop_right
+                        # min_x: face fully visible from left side
+                        min_x = face_half_w_rel + (target_w / 2) / vid_w
+                        # max_x: face fully visible from right side  
+                        max_x = 1.0 - face_half_w_rel - (target_w / 2) / vid_w
+                        # Also ensure crop doesn't go beyond video bounds
+                        min_x = max(min_x, (target_w / 2) / vid_w)
+                        max_x = min(max_x, 1.0 - (target_w / 2) / vid_w)
+                        
+                        if min_x < max_x:
+                            clamped_x = max(min_x, min(max_x, speaker_x))
+                        else:
+                            clamped_x = 0.5  # fallback: center
+                        
+                        tracking_points.append((f['timestamp'], clamped_x))
                         last_t = f['timestamp']
                 
                 if len(tracking_points) < 2:
@@ -606,6 +872,14 @@ def generate_ass_subtitle(words, analysis, title=None, speed_factor=1.0):
         # Hook: large yellow, thick border, middle-center (Alignment=5), MarginV=300 from center
         "Style: Hook,DejaVu Sans,72,&H0000FFFF,&H00FFFFFF,&H00000000,&H00000000,"
         "-1,0,0,0,100,100,4,0,1,6,0,5,60,60,100,1\n"
+        # Watermark: small white, semi-transparent, top-right (Alignment=9)
+        # PrimaryColour &H50FFFFFF = white at ~70% opacity
+        "Style: Watermark,DejaVu Sans,30,&H50FFFFFF,&H50FFFFFF,&H60000000,&H00000000,"
+        "-1,0,0,0,100,100,1,0,1,2,1,9,0,30,25,1\n"
+        # Source: small white, more transparent, bottom-left (Alignment=1)
+        # PrimaryColour &H70FFFFFF = white at ~55% opacity
+        "Style: Source,DejaVu Sans,24,&H70FFFFFF,&H70FFFFFF,&H80000000,&H00000000,"
+        "0,0,0,0,100,100,1,0,1,1,0,1,25,0,25,1\n"
         "\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
@@ -680,10 +954,41 @@ def generate_ass_subtitle(words, analysis, title=None, speed_factor=1.0):
     
     return header + events
 
+
+def generate_watermark_events(duration, speed_factor=1.0, watermark='@visi.bisinis', channel_name=None):
+    """Generate ASS watermark events: handle watermark + source channel overlay"""
+    events = ""
+    adj_duration = duration / speed_factor
+    end_time = format_ass_time(adj_duration)
+    
+    # Watermark: top-right, subtle opacity pulse (70% → 90% → 70%) every 4 seconds
+    if watermark:
+        # Subtle pulse animation: scale 100→102→100 over 4s loop
+        # Using \t with looping effect via multiple segments
+        pulse = (
+            r"\fscx100\fscy100"
+            r"\t(0,2000,\fscx102\fscy102)"
+            r"\t(2000,4000,\fscx100\fscy100)"
+        )
+        events += (
+            f"Dialogue: 2,0:00:00.00,{end_time},Watermark,,0,0,0,,"
+            f"{{{pulse}}}{watermark}\n"
+        )
+    
+    # Source channel: bottom-left, static, more subtle
+    if channel_name:
+        source_text = f"src: {channel_name}"
+        events += (
+            f"Dialogue: 2,0:00:00.00,{end_time},Source,,0,0,0,,"
+            f"{source_text}\n"
+        )
+    
+    return events
+
 # ============================================
 # MAIN VIDEO PROCESSING
 # ============================================
-def process_video(input_file, output_file, start_time, duration, ass_file=None, hook_title=None, ai_mode='auto', tracking=True):
+def process_video(input_file, output_file, start_time, duration, ass_file=None, hook_title=None, ai_mode='auto', tracking=True, watermark='@visi.bisinis', channel_name=None):
     """Main processing function - Optimized for n8n Flow"""
     print(f"\n{'='*50}", flush=True)
     print(f"  VIDEO PROCESSING START", flush=True)
@@ -694,6 +999,8 @@ def process_video(input_file, output_file, start_time, duration, ass_file=None, 
     print(f"  AI Mode:  {ai_mode}", flush=True)
     print(f"  Tracking: {tracking}", flush=True)
     print(f"  Title:    {hook_title or '(none)'}", flush=True)
+    print(f"  Watermark: {watermark or '(none)'}", flush=True)
+    print(f"  Source:   {channel_name or '(none)'}", flush=True)
 
     # Check input file
     if not os.path.exists(input_file):
@@ -715,20 +1022,29 @@ def process_video(input_file, output_file, start_time, duration, ass_file=None, 
     # ── Step 3: Effect Preparation ──
     print(f"  [3/4] Preparing effects...", flush=True)
     
-    # SFX events
-    sfx_events = get_sfx_events(words)
+    # SFX events (enhanced: transition whoosh, hook pop, highlight ding)
+    sfx_events = get_enhanced_sfx_events(words, analysis, has_hook_title=bool(hook_title))
     print(f"    SFX triggers: {len(sfx_events)}", flush=True)
     for sfx in sfx_events:
-        print(f"      → {sfx['keyword']} at {sfx['time']:.1f}s ({os.path.basename(sfx['file'])})", flush=True)
+        print(f"      → {sfx['keyword']} at {sfx['time']:.1f}s vol={sfx.get('volume',0.2):.0%} ({os.path.basename(sfx['file'])})", flush=True)
+    
+    # Background music check
+    bg_music_path = str(ASSETS_DIR / BG_MUSIC_FILE)
+    has_bg_music = os.path.exists(bg_music_path)
+    if has_bg_music:
+        print(f"    🎵 Background music: {BG_MUSIC_FILE}", flush=True)
     
     # Generate filter_complex
     f_complex, a_stream = generate_crop_filter(analysis, duration, words, tracking=tracking)
     v_stream = "[graded]"
     speed_factor = 1.05
+    adjusted_duration = duration / speed_factor
     
     # ASS subtitle overlay
     if ass_file:
         ass_content = generate_ass_subtitle(words, analysis, title=hook_title, speed_factor=speed_factor)
+        # Append watermark events
+        ass_content += generate_watermark_events(duration, speed_factor=speed_factor, watermark=watermark, channel_name=channel_name)
         with open(ass_file, 'w', encoding='utf-8') as f:
             f.write(ass_content)
         print(f"    ASS subtitle: {ass_file} ({len(ass_content)} bytes)", flush=True)
@@ -738,17 +1054,40 @@ def process_video(input_file, output_file, start_time, duration, ass_file=None, 
         f_complex += f";[graded]ass='{ass_escaped}'[outv]"
         v_stream = "[outv]"
     
-    # SFX audio mixing
+    # ── Audio mixing: SFX + Background Music ──
+    # Input index tracking: [0] = video, [1..N] = sfx files, [N+1] = bg music (if exists)
     sfx_filter, sfx_inputs = "", []
+    next_input_idx = 1  # index 0 is the main video
+    
     if sfx_events:
         for i, sfx in enumerate(sfx_events):
             rel_t = max(0, sfx['time'] * 1000 / speed_factor)  # ms, adjusted for speed
+            vol = sfx.get('volume', 0.20)
             sfx_inputs.extend(['-i', sfx['file']])
-            sfx_filter += f"[{i + 1}:a]adelay={rel_t:.0f}|{rel_t:.0f}[sfx{i}];"
+            sfx_filter += f"[{next_input_idx}:a]adelay={rel_t:.0f}|{rel_t:.0f},volume={vol}[sfx{i}];"
+            next_input_idx += 1
         
         sfx_refs = ''.join([f'[sfx{i}]' for i in range(len(sfx_events))])
-        sfx_filter += f"{a_stream}{sfx_refs}amix=inputs={len(sfx_events) + 1}:normalize=0[mixed_audio]"
-        a_stream = "[mixed_audio]"
+        sfx_filter += f"{a_stream}{sfx_refs}amix=inputs={len(sfx_events) + 1}:normalize=0[sfx_mixed];"
+        a_stream = "[sfx_mixed]"
+    
+    # Background music: loop, low volume, fade in/out
+    bg_inputs = []
+    if has_bg_music:
+        bg_inputs.extend(['-stream_loop', '-1', '-i', bg_music_path])
+        bg_idx = next_input_idx
+        # Trim to clip duration, fade in 1s, fade out 2s, volume 8%
+        fade_out_start = max(0, adjusted_duration - 2.0)
+        sfx_filter += (
+            f"[{bg_idx}:a]atrim=0:{adjusted_duration:.2f},"
+            f"afade=t=in:d=1,afade=t=out:st={fade_out_start:.2f}:d=2,"
+            f"volume=0.08[bgm];"
+            f"{a_stream}[bgm]amix=inputs=2:normalize=0[final_audio];"
+        )
+        a_stream = "[final_audio]"
+        # Remove trailing semicolon if it's the last filter
+        if sfx_filter.endswith(';'):
+            sfx_filter = sfx_filter[:-1]
     
     full_filter = f_complex + (";" + sfx_filter if sfx_filter else "")
     
@@ -767,7 +1106,7 @@ def process_video(input_file, output_file, start_time, duration, ass_file=None, 
             'ffmpeg', '-y', '-threads', '6',
             '-ss', str(actual_start), '-t', str(duration),
             '-i', input_file
-        ] + sfx_inputs + [
+        ] + sfx_inputs + bg_inputs + [
             '-filter_complex', full_filter,
             '-map', v_stream,
             '-map', a_stream,
@@ -820,6 +1159,8 @@ if __name__ == '__main__':
     parser.add_argument('-title', dest='title_alias')
     parser.add_argument('--tracking', action='store_true', default=True)
     parser.add_argument('--no-tracking', action='store_false', dest='tracking')
+    parser.add_argument('--watermark', default='@visi.bisinis', help='Watermark text (top-right). Set to empty to disable.')
+    parser.add_argument('--channel-name', default=None, help='Source channel name (bottom-left)')
     
     args = parser.parse_args()
     
@@ -835,7 +1176,9 @@ if __name__ == '__main__':
         args.ass_file,
         args.title,
         args.ai_mode,
-        tracking=args.tracking
+        tracking=args.tracking,
+        watermark=args.watermark if args.watermark else None,
+        channel_name=args.channel_name
     )
     
     print(f"\n{'='*50}", flush=True)
